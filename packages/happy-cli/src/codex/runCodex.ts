@@ -224,6 +224,7 @@ export async function runCodex(opts: {
     });
 
     let localHandoff: (() => void) | null = null;
+    let localTerminate: (() => void) | null = null;
     let localHandoffRequested = false;
     let currentRunMode = resolveCodexStartingMode({
         startedBy: opts.startedBy,
@@ -276,20 +277,24 @@ export async function runCodex(opts: {
         }
     };
 
-    if (currentRunMode === 'local') {
+    const launchLocalCodexSession = async (codexThreadId: string | undefined): Promise<
+        | { type: 'exit'; code: number }
+        | { type: 'switch-to-remote' }
+    > => {
         let exitCode = 0;
         let switchToRemote = false;
         try {
-            if (opts.resumeThreadId) {
+            if (codexThreadId) {
                 session.updateMetadata((currentMetadata) => ({
                     ...currentMetadata,
-                    codexThreadId: opts.resumeThreadId,
+                    codexThreadId,
                 }));
             }
             const result = await launchNativeCodex({
                 cwd: process.cwd(),
                 codexHomeDir: process.env.CODEX_HOME,
-                codexThreadId: opts.resumeThreadId,
+                codexThreadId,
+                sandboxConfig,
                 model: modeState.currentModel,
                 effort: modeState.effort,
                 permissionMode: modeState.currentPermissionMode,
@@ -306,8 +311,12 @@ export async function runCodex(opts: {
                         handoff();
                     }
                 },
+                onTerminateReady: (terminate) => {
+                    localTerminate = terminate;
+                },
             });
             localHandoff = null;
+            localTerminate = null;
             if (result.type === 'switch') {
                 switchToRemote = true;
                 localHandoffRequested = false;
@@ -328,8 +337,17 @@ export async function runCodex(opts: {
                     }));
                 }
             }
+        } catch (error) {
+            exitCode = 1;
+            const message = error instanceof Error ? error.message : String(error);
+            session.sendSessionEvent({
+                type: 'message',
+                message: `Codex local launch failed: ${message}`,
+            });
+            logger.warn('[codex]: Local Codex launch failed', error);
         } finally {
             localHandoff = null;
+            localTerminate = null;
             if (!switchToRemote) {
                 if (reconnectionHandle) {
                     reconnectionHandle.cancel();
@@ -344,10 +362,8 @@ export async function runCodex(opts: {
                 clearInterval(keepAliveInterval);
             }
         }
-        if (!switchToRemote) {
-            process.exit(exitCode);
-        }
-    }
+        return switchToRemote ? { type: 'switch-to-remote' } : { type: 'exit', code: exitCode };
+    };
 
     // Debug helper: log active handles/requests if DEBUG is enabled
     function logActiveHandles(tag: string) {
@@ -378,6 +394,7 @@ export async function runCodex(opts: {
     // Turn cancellation uses client.interruptTurn() — no AbortController hack needed.
     let abortController = new AbortController();
     let shouldExit = false;
+    let switchToLocalRequested = false;
 
     /**
      * Handles aborting the current task/inference without exiting the process.
@@ -433,6 +450,23 @@ export async function runCodex(opts: {
         abortInProgress = null;
     }
 
+    const handleSwitchToLocal = async () => {
+        if (switchToLocalRequested) {
+            return;
+        }
+        switchToLocalRequested = true;
+        currentRunMode = 'local';
+        shouldExit = true;
+        session.keepAlive(thinking, 'local');
+        session.updateAgentState((currentState) => ({
+            ...currentState,
+            controlledByUser: true,
+        }));
+        await handleAbort();
+    };
+
+    let happyServer: Awaited<ReturnType<typeof startHappyServer>> | null = null;
+
     /**
      * Handles session termination and process exit.
      * This is called when the session needs to be completely killed (not just aborted).
@@ -441,6 +475,7 @@ export async function runCodex(opts: {
      */
     const handleKillSession = async () => {
         logger.debug('[Codex] Kill session requested - terminating process');
+        localTerminate?.();
         await handleAbort();
         logger.debug('[Codex] Abort completed, proceeding with termination');
 
@@ -469,7 +504,7 @@ export async function runCodex(opts: {
             }
 
             // Stop Happy MCP server
-            happyServer.stop();
+            happyServer?.stop();
 
             logger.debug('[Codex] Session termination complete, exiting');
             process.exit(0);
@@ -483,6 +518,19 @@ export async function runCodex(opts: {
     session.rpcHandlerManager.registerHandler('abort', handleAbort);
 
     registerKillSessionHandler(session.rpcHandlerManager, handleKillSession);
+
+    if (currentRunMode === 'local') {
+        const localResult = await launchLocalCodexSession(activeCodexThreadId);
+        if (localResult.type === 'exit') {
+            process.exit(localResult.code);
+        }
+    }
+
+    while (currentRunMode === 'remote') {
+        shouldExit = false;
+        switchToLocalRequested = false;
+        abortController = new AbortController();
+        let shouldRestartRemote = false;
 
     //
     // Initialize Ink UI
@@ -502,7 +550,8 @@ export async function runCodex(opts: {
                 logger.debug('[codex]: Exiting agent via Ctrl-C');
                 shouldExit = true;
                 await handleAbort();
-            }
+            },
+            onSwitchToLocal: handleSwitchToLocal,
         }), {
             exitOnCtrlC: false,
             patchConsole: false
@@ -669,7 +718,7 @@ export async function runCodex(opts: {
     });
 
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
-    const happyServer = await startHappyServer(session);
+    happyServer = await startHappyServer(session);
     // Launch the bridge via `node <path>` (rather than relying on the .mjs shebang)
     // so it works on Windows, where Windows can't execute shebang scripts directly.
     // codex would otherwise fail to start the MCP server, the change_title tool would
@@ -757,6 +806,7 @@ export async function runCodex(opts: {
                         effort: message.mode.effort,
                         mcpServers,
                     });
+                    activeCodexThreadId = startedThread.threadId;
                     session.updateMetadata((currentMetadata) => ({
                         ...currentMetadata,
                         codexThreadId: startedThread.threadId,
@@ -803,34 +853,38 @@ export async function runCodex(opts: {
         }
 
     } finally {
+        const switchingToLocal = switchToLocalRequested;
         // Clean up resources when main loop exits
         logger.debug('[codex]: Final cleanup start');
         logActiveHandles('cleanup-start');
 
         // Cancel offline reconnection if still running
-        if (reconnectionHandle) {
+        if (reconnectionHandle && !switchingToLocal) {
             logger.debug('[codex]: Cancelling offline reconnection');
             reconnectionHandle.cancel();
         }
 
-        try {
-            logger.debug('[codex]: sendSessionDeath');
-            session.sendSessionDeath();
-            logger.debug('[codex]: flush begin');
-            await session.flush();
-            logger.debug('[codex]: flush done');
-            logger.debug('[codex]: session.close begin');
-            await session.close();
-            logger.debug('[codex]: session.close done');
-        } catch (e) {
-            logger.debug('[codex]: Error while closing session', e);
+        if (!switchingToLocal) {
+            try {
+                logger.debug('[codex]: sendSessionDeath');
+                session.sendSessionDeath();
+                logger.debug('[codex]: flush begin');
+                await session.flush();
+                logger.debug('[codex]: flush done');
+                logger.debug('[codex]: session.close begin');
+                await session.close();
+                logger.debug('[codex]: session.close done');
+            } catch (e) {
+                logger.debug('[codex]: Error while closing session', e);
+            }
         }
         logger.debug('[codex]: client.disconnect begin');
         await client.disconnect();
         logger.debug('[codex]: client.disconnect done');
         // Stop Happy MCP server
         logger.debug('[codex]: happyServer.stop');
-        happyServer.stop();
+        happyServer?.stop();
+        happyServer = null;
 
         // Clean up ink UI
         if (process.stdin.isTTY) {
@@ -838,13 +892,15 @@ export async function runCodex(opts: {
             try { process.stdin.setRawMode(false); } catch { }
         }
         // Stop reading from stdin so the process can exit
-        if (hasTTY) {
+        if (hasTTY && !switchingToLocal) {
             logger.debug('[codex]: stdin.pause()');
             try { process.stdin.pause(); } catch { }
         }
         // Clear periodic keep-alive to avoid keeping event loop alive
-        logger.debug('[codex]: clearInterval(keepAlive)');
-        clearInterval(keepAliveInterval);
+        if (!switchingToLocal) {
+            logger.debug('[codex]: clearInterval(keepAlive)');
+            clearInterval(keepAliveInterval);
+        }
         if (inkInstance) {
             logger.debug('[codex]: inkInstance.unmount()');
             inkInstance.unmount();
@@ -853,5 +909,18 @@ export async function runCodex(opts: {
 
         logActiveHandles('cleanup-end');
         logger.debug('[codex]: Final cleanup completed');
+
+        if (switchingToLocal) {
+            const localResult = await launchLocalCodexSession(activeCodexThreadId);
+            if (localResult.type === 'exit') {
+                process.exit(localResult.code);
+            }
+            shouldRestartRemote = true;
+        }
+    }
+
+        if (!shouldRestartRemote) {
+            break;
+        }
     }
 }

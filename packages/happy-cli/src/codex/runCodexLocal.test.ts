@@ -20,6 +20,11 @@ const mocks = vi.hoisted(() => ({
         disconnect: vi.fn(),
         abortTurnWithFallback: vi.fn(),
     },
+    render: vi.fn(),
+    renderedElement: null as null | {
+        type: unknown;
+        props: Record<string, unknown>;
+    },
     reconnectionCancel: vi.fn(),
     userMessageHandler: null as null | ((message: {
         content: { text: string };
@@ -47,6 +52,10 @@ const mocks = vi.hoisted(() => ({
 vi.mock('node:child_process', async (importOriginal) => ({
     ...(await importOriginal<typeof import('node:child_process')>()),
     execSync: mocks.execSync,
+}));
+
+vi.mock('ink', () => ({
+    render: mocks.render,
 }));
 
 vi.mock('@/api/api', () => ({
@@ -146,6 +155,11 @@ describe('runCodex local start', () => {
         mocks.remoteClient.sendTurnAndWait.mockResolvedValue({ aborted: false });
         mocks.remoteClient.disconnect.mockResolvedValue(undefined);
         mocks.remoteClient.abortTurnWithFallback.mockResolvedValue({ forcedRestart: false });
+        mocks.render.mockImplementation((element) => {
+            mocks.renderedElement = element;
+            return { unmount: vi.fn() };
+        });
+        mocks.renderedElement = null;
         mocks.session.getMetadata.mockReturnValue({});
         mocks.session.onUserMessage.mockImplementation((handler) => {
             mocks.userMessageHandler = handler;
@@ -178,15 +192,62 @@ describe('runCodex local start', () => {
             cwd: process.cwd(),
             codexHomeDir: undefined,
             codexThreadId: 'thread-123',
+            sandboxConfig: undefined,
             model: 'gpt-5.5',
             effort: 'medium',
             permissionMode: 'yolo',
             onThreadIdDiscovered: expect.any(Function),
+            onTerminateReady: expect.any(Function),
         }));
         expect(mocks.session.sendSessionDeath).toHaveBeenCalled();
         expect(mocks.session.flush).toHaveBeenCalled();
         expect(mocks.session.close).toHaveBeenCalled();
         expect(exit).toHaveBeenCalledWith(4);
+
+        exit.mockRestore();
+    });
+
+    it('passes configured Happy sandbox settings to native Codex', async () => {
+        const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: string | number | null) => {
+            throw new Error(`exit:${code}`);
+        }) as never);
+        const sandboxConfig = {
+            enabled: true,
+            network: { enabled: false },
+            filesystem: { read: [], write: [] },
+        };
+        mocks.readSettings.mockResolvedValue({ machineId: 'machine-1', sandboxConfig });
+
+        await expect(runCodex({
+            credentials: { token: 'token' } as never,
+            startedBy: 'terminal',
+            startingMode: 'local',
+        })).rejects.toThrow('exit:4');
+
+        expect(mocks.launchNativeCodex).toHaveBeenCalledWith(expect.objectContaining({
+            sandboxConfig,
+        }));
+
+        exit.mockRestore();
+    });
+
+    it('surfaces native Codex discovery failures as Happy session messages', async () => {
+        const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: string | number | null) => {
+            throw new Error(`exit:${code}`);
+        }) as never);
+        mocks.launchNativeCodex.mockRejectedValue(new Error('Ambiguous Codex thread discovery for cwd /tmp/project: one, two'));
+
+        await expect(runCodex({
+            credentials: { token: 'token' } as never,
+            startedBy: 'terminal',
+            startingMode: 'local',
+        })).rejects.toThrow('exit:1');
+
+        expect(mocks.session.sendSessionEvent).toHaveBeenCalledWith({
+            type: 'message',
+            message: expect.stringContaining('Ambiguous Codex thread discovery'),
+        });
+        expect(exit).toHaveBeenCalledWith(1);
 
         exit.mockRestore();
     });
@@ -278,5 +339,129 @@ describe('runCodex local start', () => {
             expect.stringContaining('early mobile prompt'),
             expect.any(Object),
         );
+    });
+
+    it('switches terminal remote mode back to native Codex with the active thread id', async () => {
+        const stdoutIsTTY = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+        const stdinIsTTY = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
+        const setRawMode = process.stdin.setRawMode;
+        const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: string | number | null) => {
+            throw new Error(`exit:${code}`);
+        }) as never);
+        Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+        Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: true });
+        process.stdin.setRawMode = vi.fn() as never;
+
+        mocks.remoteClient.hasActiveThread.mockReturnValue(false);
+        mocks.remoteClient.startThread.mockResolvedValue({ threadId: 'thread-started', model: 'gpt-test' });
+        mocks.remoteClient.sendTurnAndWait.mockImplementation(async () => {
+            const onSwitchToLocal = mocks.renderedElement?.props.onSwitchToLocal;
+            if (typeof onSwitchToLocal !== 'function') {
+                throw new Error('missing onSwitchToLocal');
+            }
+            await onSwitchToLocal();
+            return { aborted: true };
+        });
+        mocks.launchNativeCodex.mockResolvedValue({ type: 'exit', code: 0, codexThreadId: 'thread-started' });
+        mocks.session.onUserMessage.mockImplementation((handler) => {
+            mocks.userMessageHandler = handler;
+            handler({
+                content: { text: 'remote prompt' },
+                meta: {},
+            });
+        });
+
+        try {
+            await expect(runCodex({
+                credentials: { token: 'token' } as never,
+                startedBy: 'terminal',
+                startingMode: 'remote',
+            })).rejects.toThrow('exit:0');
+
+            expect(mocks.remoteClient.startThread).toHaveBeenCalled();
+            expect(mocks.remoteClient.abortTurnWithFallback).toHaveBeenCalled();
+            expect(mocks.launchNativeCodex).toHaveBeenCalledWith(expect.objectContaining({
+                codexThreadId: 'thread-started',
+            }));
+        } finally {
+            if (stdoutIsTTY) {
+                Object.defineProperty(process.stdout, 'isTTY', stdoutIsTTY);
+            }
+            if (stdinIsTTY) {
+                Object.defineProperty(process.stdin, 'isTTY', stdinIsTTY);
+            }
+            process.stdin.setRawMode = setRawMode;
+            exit.mockRestore();
+        }
+    });
+
+    it('restarts remote mode when a mobile message arrives after terminal switch-back', async () => {
+        const stdoutIsTTY = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+        const stdinIsTTY = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
+        const setRawMode = process.stdin.setRawMode;
+        Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+        Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: true });
+        process.stdin.setRawMode = vi.fn() as never;
+
+        let sendCount = 0;
+        mocks.remoteClient.hasActiveThread.mockReturnValue(false);
+        mocks.remoteClient.startThread.mockResolvedValue({ threadId: 'thread-started', model: 'gpt-test' });
+        mocks.remoteClient.sendTurnAndWait.mockImplementation(async () => {
+            sendCount += 1;
+            if (sendCount === 1) {
+                const onSwitchToLocal = mocks.renderedElement?.props.onSwitchToLocal;
+                if (typeof onSwitchToLocal !== 'function') {
+                    throw new Error('missing onSwitchToLocal');
+                }
+                await onSwitchToLocal();
+                return { aborted: true };
+            }
+            return { aborted: false };
+        });
+        mocks.launchNativeCodex.mockImplementation(async (opts) => {
+            opts.onLocalHandoffReady(() => undefined);
+            mocks.userMessageHandler?.({
+                content: { text: 'second mobile prompt' },
+                meta: {},
+            });
+            return { type: 'switch', codexThreadId: 'thread-started' };
+        });
+        mocks.session.onUserMessage.mockImplementation((handler) => {
+            mocks.userMessageHandler = handler;
+            handler({
+                content: { text: 'first remote prompt' },
+                meta: {},
+            });
+        });
+
+        try {
+            await expect(runCodex({
+                credentials: { token: 'token' } as never,
+                startedBy: 'terminal',
+                startingMode: 'remote',
+            })).resolves.toBeUndefined();
+
+            expect(mocks.remoteClient.connect).toHaveBeenCalledTimes(2);
+            expect(mocks.startHappyServer).toHaveBeenCalledTimes(2);
+            expect(mocks.launchNativeCodex).toHaveBeenCalledWith(expect.objectContaining({
+                codexThreadId: 'thread-started',
+            }));
+            expect(mocks.remoteClient.resumeThread).toHaveBeenCalledWith(expect.objectContaining({
+                threadId: 'thread-started',
+            }));
+            expect(mocks.remoteClient.sendTurnAndWait).toHaveBeenNthCalledWith(
+                2,
+                'second mobile prompt',
+                expect.any(Object),
+            );
+        } finally {
+            if (stdoutIsTTY) {
+                Object.defineProperty(process.stdout, 'isTTY', stdoutIsTTY);
+            }
+            if (stdinIsTTY) {
+                Object.defineProperty(process.stdin, 'isTTY', stdinIsTTY);
+            }
+            process.stdin.setRawMode = setRawMode;
+        }
     });
 });
